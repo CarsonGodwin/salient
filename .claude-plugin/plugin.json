@@ -1,0 +1,9 @@
+{
+  "name": "salient",
+  "version": "0.1.0",
+  "description": "Reviews each edit against the real-world conditions of the feature it touches (usage, scale, failure cost) and feeds scoped findings back to the agent. Quiet unless the edited file is anchored to a business entry.",
+  "author": {
+    "name": "Carson Godwin"
+  },
+  "license": "MIT"
+}

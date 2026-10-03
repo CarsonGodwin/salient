@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""salient CLI: inspect business entries and measure the hook.
+
+  salient validate              parse every business entry, report problems
+  salient match PATH...         which entries a path resolves to (0, 1 or many)
+  salient hash                  current sha256 of every exact-path anchor
+  salient replay [RANGE]        anchor precision over real commits (default: last 50)
+  salient report [--session S]  fire rate, injections, latency, findings from the log
+
+Run from the project root, or pass --root.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from collections import Counter, defaultdict
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "hooks"))
+
+from salient import business, config, record  # noqa: E402
+
+
+def _entries(args):
+    bdir = args.business_dir if os.path.isabs(args.business_dir) else os.path.join(args.root, args.business_dir)
+    entries = business.load_all(bdir)
+    if not entries:
+        print(f"no business entries in {bdir}", file=sys.stderr)
+    return entries
+
+
+def _tracked_files(root):
+    r = subprocess.run(["git", "-C", root, "ls-files", "--cached", "--others", "--exclude-standard"], capture_output=True, text=True)
+    if r.returncode == 0:
+        return r.stdout.splitlines()
+    out = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if not x.startswith(".")]
+        out += [os.path.relpath(os.path.join(d, f), root).replace(os.sep, "/") for f in files]
+    return out
+
+
+def cmd_validate(args):
+    entries = _entries(args)
+    files = _tracked_files(args.root)
+    bad = 0
+    for e in entries:
+        hits = [f for f in files if e.matches(f)]
+        tags = Counter(c.confidence for c in e.conditions)
+        print(f"{e.id}  ({os.path.relpath(e.path, args.root)})")
+        print(f"  anchors: {len(e.anchors)} patterns -> {len(hits)} files")
+        print(f"  conditions: {len(e.conditions)}  " +
+              "  ".join(f"{k}={v}" for k, v in sorted(tags.items())))
+        problems = list(e.problems)
+        for a in e.anchors:
+            if not any(a.matches(f) for f in files):
+                problems.append(f"anchor matches nothing: {a.pattern}")
+            if a.hash and not a.is_glob:
+                try:
+                    with open(os.path.join(args.root, a.pattern), encoding="utf-8", errors="replace") as fh:
+                        if business.file_hash(fh.read()) != a.hash:
+                            problems.append(f"drift: {a.pattern} changed since its hash was recorded")
+                except OSError:
+                    pass
+        for c in e.context:
+            if not os.path.exists(os.path.join(args.root, c)):
+                problems.append(f"context file missing: {c}")
+        for p in problems:
+            print(f"  ! {p}")
+        bad += bool(problems)
+    overlap = defaultdict(list)
+    for f in files:
+        ids = [e.id for e in entries if e.matches(f)]
+        if len(ids) > 1:
+            overlap[tuple(ids)].append(f)
+    for ids, fs in overlap.items():
+        print(f"overlap: {len(fs)} files match {', '.join(ids)} (e.g. {fs[0]})")
+    return 1 if bad else 0
+
+
+def cmd_match(args):
+    entries = _entries(args)
+    for p in args.paths:
+        rel = business.to_rel(p, args.root) or p
+        ids = [e.id for e in business.match(entries, rel)]
+        print(f"{rel}: {', '.join(ids) if ids else '(none)'}")
+    return 0
+
+
+def cmd_hash(args):
+    for e in _entries(args):
+        for a in e.anchors:
+            if a.is_glob:
+                continue
+            try:
+                with open(os.path.join(args.root, a.pattern), encoding="utf-8", errors="replace") as fh:
+                    h = business.file_hash(fh.read())
+            except OSError:
+                h = "(missing)"
+            flag = "" if not a.hash else ("  ok" if a.hash == h else "  DRIFT")
+            print(f"{e.id}  {a.pattern}\n  hash: {h}{flag}")
+    return 0
+
+
+def cmd_replay(args):
+    """For each commit, which business entries its changed files resolve to.
+    0 is a silent miss if the commit touched the feature; 2+ is noise."""
+    entries = _entries(args)
+    rng = args.range or f"-{args.max}"
+    r = subprocess.run(["git", "-C", args.root, "log", "--format=@@%h %s", "--name-only", rng],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr.strip(), file=sys.stderr)
+        return 1
+    commits, cur = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("@@"):
+            cur = {"sha": line[2:].split(" ", 1)[0], "subject": line[2:].split(" ", 1)[-1], "files": []}
+            commits.append(cur)
+        elif line.strip() and cur is not None:
+            cur["files"].append(line.strip())
+    dist = Counter()
+    for c in commits:
+        ids = sorted({e.id for f in c["files"] for e in business.match(entries, f)})
+        dist[min(len(ids), 2)] += 1
+        label = ", ".join(ids) if ids else "-"
+        print(f"{c['sha']}  {len(c['files']):>3} files  [{label}]  {c['subject'][:70]}")
+    n = len(commits) or 1
+    print(f"\n{len(commits)} commits: no entry {dist[0]} ({dist[0]*100//n}%), "
+          f"exactly one {dist[1]} ({dist[1]*100//n}%), two or more {dist[2]} ({dist[2]*100//n}%)")
+    print("Label the commits that actually touched a documented feature to turn this into precision/recall.")
+    return 0
+
+
+def _pct(xs, q):
+    if not xs:
+        return 0
+    xs = sorted(xs)
+    # nearest-rank: p50 of [a, b] is a, not b
+    import math
+    return xs[max(0, math.ceil(q * len(xs)) - 1)]
+
+
+def cmd_report(args):
+    path = args.log or record.log_path(config.data_dir())
+    try:
+        with open(path) as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+    except OSError:
+        print(f"no log at {path}")
+        return 1
+    if args.session:
+        rows = [r for r in rows if r.get("session") == args.session]
+    kinds = Counter(r.get("kind") for r in rows)
+    edits = kinds["edit"] + kinds["review"] + kinds["capped"] + kinds["skip"] + kinds["error"]
+    reviews = [r for r in rows if r.get("kind") == "review"]
+    injected = [r for r in reviews if r.get("injected")]
+    lat = [r["latency_ms"] for r in reviews if "latency_ms" in r]
+    sev = Counter(f["severity"] for r in reviews for f in r.get("findings", []))
+    by_entry = Counter(i for r in reviews for i in r.get("matched", []))
+    multi = sum(1 for r in reviews if len(r.get("matched", [])) > 1)
+
+    print(f"log: {path}")
+    print(f"edits seen (in projects with business/): {edits}")
+    print(f"anchored edits reviewed: {len(reviews)}   fire rate: "
+          f"{(len(reviews) * 100 // edits) if edits else 0}% of edits")
+    print(f"reviews with findings (interruptions): {len(injected)}   "
+          f"interrupt rate: {(len(injected) * 100 // edits) if edits else 0}% of edits")
+    print(f"reviews matching 2+ entries: {multi}")
+    print(f"capped: {kinds['capped']}   errors: {kinds['error']}   crashes: {kinds['crash']}   "
+          f"business writes denied: {kinds['business_write_denied']}")
+    if lat:
+        print(f"critic latency ms: p50 {_pct(lat, .5)}  p90 {_pct(lat, .9)}  max {max(lat)}")
+    if sev:
+        print("findings by severity: " + "  ".join(f"{k}={v}" for k, v in sev.items()))
+    if by_entry:
+        print("reviews by entry: " + "  ".join(f"{k}={v}" for k, v in by_entry.most_common()))
+    rechecks = [r for r in reviews if r.get("review_index", 1) > 1]
+    if rechecks:
+        def sev_score(fs):
+            return sum({"high": 3, "medium": 2, "low": 1}.get(f.get("severity"), 0) for f in fs or [])
+        prev = {}
+        cleared = reduced = same = 0
+        for r in reviews:
+            k = (r.get("session"), r.get("prompt"), r.get("file"))
+            if r.get("review_index", 1) > 1 and k in prev:
+                before, after = sev_score(prev[k]), sev_score(r.get("findings"))
+                if after == 0:
+                    cleared += 1
+                elif after < before:
+                    reduced += 1
+                else:
+                    same += 1
+            prev[k] = r.get("findings")
+        n = len(rechecks)
+        print(f"re-reviews after a revision: {n}   cleared {cleared}   reduced {reduced}   "
+              f"unchanged/worse {same}")
+        print("  reduced/unchanged can still be correct (e.g. the fix needs info outside the repo); "
+              "read those diffs")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="salient", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=os.getcwd())
+    ap.add_argument("--business-dir", default=os.environ.get("SALIENT_BUSINESS_DIR", "business"))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("validate")
+    m = sub.add_parser("match")
+    m.add_argument("paths", nargs="+")
+    sub.add_parser("hash")
+    rp = sub.add_parser("replay")
+    rp.add_argument("range", nargs="?")
+    rp.add_argument("--max", type=int, default=50)
+    rep = sub.add_parser("report")
+    rep.add_argument("--log")
+    rep.add_argument("--session")
+    args = ap.parse_args()
+    args.root = os.path.realpath(args.root)
+    return {"validate": cmd_validate, "match": cmd_match, "hash": cmd_hash,
+            "replay": cmd_replay, "report": cmd_report}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

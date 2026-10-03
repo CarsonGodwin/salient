@@ -1,0 +1,13 @@
+{
+  "name": "salient",
+  "owner": {
+    "name": "Carson Godwin"
+  },
+  "plugins": [
+    {
+      "name": "salient",
+      "source": "./",
+      "description": "Scoped business-condition review for Claude Code edits"
+    }
+  ]
+}
